@@ -1,3 +1,4 @@
+# Auto-retry failed AUR workflows up to 3 attempts
 name: Retry AUR Workflows
 
 on:

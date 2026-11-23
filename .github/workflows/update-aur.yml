@@ -11,6 +11,12 @@ on:
         required: false
         type: boolean
         default: false
+  push:
+    branches:
+      - master
+    paths:
+      - .github/scripts/**
+      - .github/workflows/update-aur.yml
 
 permissions:
   contents: write
@@ -40,7 +46,7 @@ jobs:
         env:
           UPSTREAM_VERSION: ${{ steps.latest.outputs.version }}
           UPSTREAM_BUILD: ${{ steps.latest.outputs.build_id }}
-          FORCE_RECHECK: ${{ inputs.force_recheck || false }}
+          FORCE_RECHECK: ${{ inputs.force_recheck == true && 'true' || 'false' }}
         shell: bash
         run: |
           set -euo pipefail
