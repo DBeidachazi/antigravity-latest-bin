@@ -1,0 +1,193 @@
+name: Update AUR Package
+
+on:
+  schedule:
+    # 每 6 小时检查一次上游发布页与更新接口
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_recheck:
+        description: '强制重新下载安装包并校验 b2sum'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: antigravity-latest-bin-aur-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch latest upstream release
+        id: latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/fetch-latest-release.sh
+
+      - name: Check if package metadata needs download
+        id: check
+        env:
+          UPSTREAM_VERSION: ${{ steps.latest.outputs.version }}
+          UPSTREAM_BUILD: ${{ steps.latest.outputs.build_id }}
+          FORCE_RECHECK: ${{ inputs.force_recheck || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_VERSION=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          CURRENT_BUILD=$(sed -n 's/^_build=//p' PKGBUILD)
+
+          if [[ ! "$CURRENT_VERSION" =~ ^[0-9]+(\.[0-9]+)+$ || ! "$CURRENT_BUILD" =~ ^[0-9]+$ ]]; then
+            echo "错误: 当前 PKGBUILD 版本信息无效: ${CURRENT_VERSION} / ${CURRENT_BUILD}" >&2
+            exit 1
+          fi
+
+          HIGHEST_VERSION=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$UPSTREAM_VERSION" | sort -V | tail -n 1)
+          if [[ "$CURRENT_VERSION" != "$UPSTREAM_VERSION" && "$HIGHEST_VERSION" != "$UPSTREAM_VERSION" ]]; then
+            echo "错误: 官网返回版本 $UPSTREAM_VERSION 低于当前版本 $CURRENT_VERSION，拒绝降级" >&2
+            exit 1
+          fi
+
+          echo "当前版本: ${CURRENT_VERSION} (build ${CURRENT_BUILD})"
+          echo "最新版本: ${UPSTREAM_VERSION} (build ${UPSTREAM_BUILD})"
+
+          if [[ "$UPSTREAM_VERSION" != "$CURRENT_VERSION" || \
+                "$UPSTREAM_BUILD" != "$CURRENT_BUILD" || \
+                "$FORCE_RECHECK" == "true" ]]; then
+            echo "need_download=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "版本与 Build ID 均已是最新，跳过下载"
+            echo "need_download=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download tarballs and update metadata
+        if: steps.check.outputs.need_download == 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          BUILD_ID: ${{ steps.latest.outputs.build_id }}
+          X86_64_URL: ${{ steps.latest.outputs.x86_64_url }}
+          AARCH64_URL: ${{ steps.latest.outputs.aarch64_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORK_DIR="$RUNNER_TEMP/antigravity-downloads"
+          X86_64_TAR="$WORK_DIR/Antigravity-${VERSION}-${BUILD_ID}-x86_64.tar.gz"
+          AARCH64_TAR="$WORK_DIR/Antigravity-${VERSION}-${BUILD_ID}-aarch64.tar.gz"
+
+          bash .github/scripts/download-and-validate.sh "$X86_64_URL" "$X86_64_TAR" "x86_64"
+          bash .github/scripts/download-and-validate.sh "$AARCH64_URL" "$AARCH64_TAR" "aarch64"
+
+          X86_64_B2=$(b2sum "$X86_64_TAR" | awk '{print $1}')
+          AARCH64_B2=$(b2sum "$AARCH64_TAR" | awk '{print $1}')
+          rm -rf "$WORK_DIR"
+
+          bash .github/scripts/update-package-metadata.sh \
+            "$VERSION" "$BUILD_ID" "$X86_64_B2" "$AARCH64_B2"
+
+      - name: Setup SSH for AUR
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+
+          for attempt in 1 2 3; do
+            if ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null; then
+              break
+            fi
+            echo "ssh-keyscan 失败 (第 ${attempt}/3 次尝试)" >&2
+            if (( attempt < 3 )); then sleep $((attempt * 5)); continue; fi
+            exit 1
+          done
+
+          cat >> ~/.ssh/config << 'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+            AddressFamily inet
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Sync to AUR
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
+          FINAL_VERSION=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          FINAL_PKGREL=$(sed -n 's/^pkgrel=//p' PKGBUILD)
+          AUR_DIR="$RUNNER_TEMP/aur-repo"
+
+          for attempt in 1 2 3; do
+            rm -rf "$AUR_DIR"
+            if git clone ssh://aur@aur.archlinux.org/antigravity-latest-bin.git "$AUR_DIR"; then
+              break
+            fi
+            echo "AUR 仓库克隆失败 (第 ${attempt}/3 次尝试)" >&2
+            if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
+
+          cp PKGBUILD .SRCINFO antigravity.desktop antigravity.png "$AUR_DIR/"
+          cd "$AUR_DIR"
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add PKGBUILD .SRCINFO antigravity.desktop antigravity.png
+
+          if git diff --staged --quiet; then
+            echo "AUR 仓库已是最新 (${FINAL_VERSION}-${FINAL_PKGREL})，无需推送"
+            exit 0
+          fi
+
+          git commit -m "upgpkg: antigravity-latest-bin ${FINAL_VERSION}-${FINAL_PKGREL}"
+          for attempt in 1 2 3; do
+            if git push origin master; then
+              echo "AUR 已成功更新到 ${FINAL_VERSION}-${FINAL_PKGREL}"
+              exit 0
+            fi
+            echo "AUR 推送失败 (第 ${attempt}/3 次尝试)" >&2
+            if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
+
+      - name: Commit to GitHub
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FINAL_VERSION=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          FINAL_PKGREL=$(sed -n 's/^pkgrel=//p' PKGBUILD)
+
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add PKGBUILD .SRCINFO
+
+          if git diff --staged --quiet; then
+            echo "GitHub 仓库无需提交变更"
+            exit 0
+          fi
+
+          git commit -m "upgpkg: antigravity-latest-bin ${FINAL_VERSION}-${FINAL_PKGREL}"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin master && git push origin master; then
+              exit 0
+            fi
+            echo "GitHub 推送失败 (第 ${attempt}/3 次尝试)" >&2
+            if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done

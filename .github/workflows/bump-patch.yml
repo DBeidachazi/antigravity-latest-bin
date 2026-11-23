@@ -1,0 +1,130 @@
+name: Bump Package Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: antigravity-latest-bin-aur-update
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Bump pkgrel
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          CURRENT_PKGREL=$(sed -n 's/^pkgrel=//p' PKGBUILD)
+
+          if [[ ! "$CURRENT_PKGREL" =~ ^[0-9]+$ ]]; then
+            echo "不支持的 pkgrel: $CURRENT_PKGREL" >&2
+            exit 1
+          fi
+
+          NEW_PKGREL=$((CURRENT_PKGREL + 1))
+          sed -i "s/^pkgrel=.*/pkgrel=${NEW_PKGREL}/" PKGBUILD
+          sed -i "s/^[[:space:]]*pkgrel = .*/\tpkgrel = ${NEW_PKGREL}/" .SRCINFO
+          bash -n PKGBUILD
+
+          echo "软件包版本: ${VERSION}-${CURRENT_PKGREL} -> ${VERSION}-${NEW_PKGREL}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=$NEW_PKGREL" >> "$GITHUB_OUTPUT"
+
+      - name: Setup SSH for AUR
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+
+          for attempt in 1 2 3; do
+            if ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null; then
+              break
+            fi
+            echo "ssh-keyscan 失败 (第 ${attempt}/3 次尝试)" >&2
+            if (( attempt < 3 )); then sleep $((attempt * 5)); continue; fi
+            exit 1
+          done
+
+          cat >> ~/.ssh/config << 'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+            AddressFamily inet
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Push to AUR
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          PKGREL: ${{ steps.bump.outputs.pkgrel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+
+          AUR_DIR="$RUNNER_TEMP/aur-repo"
+          for attempt in 1 2 3; do
+            rm -rf "$AUR_DIR"
+            if git clone ssh://aur@aur.archlinux.org/antigravity-latest-bin.git "$AUR_DIR"; then
+              break
+            fi
+            echo "AUR 仓库克隆失败 (第 ${attempt}/3 次尝试)" >&2
+            if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
+
+          cp PKGBUILD .SRCINFO antigravity.desktop antigravity.png "$AUR_DIR/"
+          cd "$AUR_DIR"
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add PKGBUILD .SRCINFO antigravity.desktop antigravity.png
+          git diff --staged --quiet || git commit -m "upgpkg: antigravity-latest-bin ${VERSION}-${PKGREL}"
+
+          if ! git diff origin/master --quiet; then
+            for attempt in 1 2 3; do
+              if git push origin master; then
+                exit 0
+              fi
+              echo "AUR 推送失败 (第 ${attempt}/3 次尝试)" >&2
+              if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
+              exit 1
+            done
+          fi
+
+      - name: Commit to GitHub
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          PKGREL: ${{ steps.bump.outputs.pkgrel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add PKGBUILD .SRCINFO
+          git diff --staged --quiet || git commit -m "upgpkg: antigravity-latest-bin ${VERSION}-${PKGREL}"
+
+          for attempt in 1 2 3; do
+            if git pull --rebase origin master && git push origin master; then
+              exit 0
+            fi
+            echo "GitHub 推送失败 (第 ${attempt}/3 次尝试)" >&2
+            if (( attempt < 3 )); then sleep $((attempt * 10)); continue; fi
+            exit 1
+          done
